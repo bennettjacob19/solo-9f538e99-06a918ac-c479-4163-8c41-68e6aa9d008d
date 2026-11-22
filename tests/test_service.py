@@ -1,4 +1,4 @@
-"""端到端自测：排序正确性/稳定性、配额拒绝、并行、排队、失败清理、下载门禁。"""
+"""端到端自测：排序正确性/稳定性、配额拒绝、并行、排队、失败清理、下载门禁、补录归并。"""
 from __future__ import annotations
 
 import json
@@ -81,6 +81,20 @@ def submit(client: TestClient, filename: str) -> str:
     r = client.post("/api/jobs", json={"filename": filename})
     assert r.status_code == 202, r.text
     return r.json()["job_id"]
+
+
+def submit_append(client: TestClient, base_job_id: str, filename: str) -> str:
+    r = client.post(f"/api/jobs/{base_job_id}/append", json={"filename": filename})
+    assert r.status_code == 202, r.text
+    return r.json()["job_id"]
+
+
+def stable_merge(sorted_old_lines: list, new_lines: list) -> str:
+    """补录期望输出：旧成品行 + 补录行，按毫秒稳定排序（同刻旧行在前、补录行保原序）。"""
+    return "".join(sorted(
+        list(sorted_old_lines) + list(new_lines),
+        key=lambda l: parse_ts_ms(json.loads(l)["ts_ms"], 0, "ts_ms"),
+    ))
 
 
 def two_log_files(logs_dir: Path):
@@ -382,3 +396,297 @@ def test_parse_ts_ms_formats():
         parse_ts_ms("not-a-time", 1, "ts_ms")
     with pytest.raises(SortError):
         parse_ts_ms(True, 1, "ts_ms")
+
+
+# ---------- 补录（增量归并） ----------
+
+def test_append_same_ms_order_and_chain(tmp_path):
+    """同毫秒补录：旧成品行在前、补录行按原行序接上；新成品可再作补录起点。"""
+    settings = make_settings(tmp_path, quota_bytes=1 << 20, batch_bytes=96)
+    base_events = [
+        {"ts_ms": BASE + 1000, "origin": "base", "seq": 0, "event": "down"},
+        {"ts_ms": BASE + 3000, "origin": "base", "seq": 1, "event": "up"},
+        {"ts_ms": BASE + 3000, "origin": "base", "seq": 2, "event": "flap"},
+        {"ts_ms": BASE + 5000, "origin": "base", "seq": 3, "event": "up"},
+    ]
+    write_log(settings.logs_dir, "base.ndjson", base_events)
+    late_events = [
+        {"ts_ms": BASE + 3000, "origin": "late", "seq": 0, "event": "flap"},   # 同毫秒
+        {"ts_ms": BASE + 2000, "origin": "late", "seq": 1, "event": "down"},   # 插入中间
+        {"ts_ms": BASE + 3000, "origin": "late", "seq": 2, "event": "up"},     # 同毫秒，原行序在后
+        {"ts_ms": BASE + 6000, "origin": "late", "seq": 3, "event": "up"},     # 尾部
+    ]
+    # 补录文件末行不写换行：服务端补换行，且补换行算入补录大小
+    late_lines = write_log(settings.logs_dir, "late.ndjson", late_events,
+                           trailing_newline=False)
+    with TestClient(create_app(settings)) as client:
+        base_job = submit(client, "base.ndjson")
+        assert wait_job(client, base_job)["state"] == "completed"
+        base_body = client.get(f"/api/jobs/{base_job}/download").text
+
+        (settings.logs_dir / "base.ndjson").unlink()  # 补录不依赖旧原始日志
+
+        append_job = submit_append(client, base_job, "late.ndjson")
+        snap = wait_job(client, append_job)
+        assert snap["state"] == "completed", snap["error"]
+        assert snap["kind"] == "append"
+        assert snap["base_job_id"] == base_job
+        assert snap["base_bytes"] == len(base_body.encode())
+        assert snap["shard_count"] >= 2  # 只给补录内容生成分片（小批次 → 多片）
+
+        body = client.get(f"/api/jobs/{append_job}/download").text
+        expected = stable_merge(base_body.splitlines(keepends=True), late_lines)
+        assert body == expected
+        ties = [json.loads(l) for l in body.splitlines()
+                if json.loads(l)["ts_ms"] == BASE + 3000]
+        # 同毫秒：旧成品两行在前，补录两行按补录文件原行序接上
+        assert [(t["origin"], t["seq"]) for t in ties] == [
+            ("base", 1), ("base", 2), ("late", 0), ("late", 2),
+        ]
+
+        # 链式补录：新成品作为下一次补录的起点
+        late2_events = [
+            {"ts_ms": BASE + 3000, "origin": "late2", "seq": 0, "event": "flap"},
+            {"ts_ms": BASE + 7000, "origin": "late2", "seq": 1, "event": "up"},
+        ]
+        late2_lines = write_log(settings.logs_dir, "late2.ndjson", late2_events)
+        job3 = submit_append(client, append_job, "late2.ndjson")
+        snap3 = wait_job(client, job3)
+        assert snap3["state"] == "completed", snap3["error"]
+        assert snap3["base_job_id"] == append_job
+        body3 = client.get(f"/api/jobs/{job3}/download").text
+        assert body3 == stable_merge(body.splitlines(keepends=True), late2_lines)
+        ties3 = [json.loads(l)["origin"] for l in body3.splitlines()
+                 if json.loads(l)["ts_ms"] == BASE + 3000]
+        assert ties3 == ["base", "base", "late", "late", "late2"]
+
+        # 各代成品都可下载（补录不影响旧成品）
+        assert client.get(f"/api/jobs/{base_job}/download").text == base_body
+        quota = client.get("/api/quota").json()
+        assert quota["reserved_bytes"] == 0
+        assert quota["temp_bytes_used"] == 0
+    assert list(settings.temp_dir.iterdir()) == []
+
+
+def test_append_budget_full_resort_rejected_but_append_completes(tmp_path):
+    """配额只够"旧成品 + 2×补录"：全量重排被拒绝，补录受理并完成。"""
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    base_events = [{"ts_ms": BASE + i * 1000, "pad": "b" * 70, "i": i} for i in range(5)]
+    supp_events = [{"ts_ms": BASE + 300 + i * 700, "pad": "s" * 60, "i": i} for i in range(4)]
+    base_lines = write_log(logs, "base.ndjson", base_events)
+    supp_lines = write_log(logs, "supp.ndjson", supp_events)
+    combined_lines = base_lines + supp_lines  # 全量重排输入（仅用于对照，服务不需要它）
+    write_log(logs, "combined.ndjson", [json.loads(l) for l in combined_lines])
+
+    old_bytes = (logs / "base.ndjson").stat().st_size      # 旧成品字节数（末行有换行，输出同长）
+    supp_bytes = (logs / "supp.ndjson").stat().st_size
+    quota = old_bytes + 2 * (supp_bytes + 1)               # 补录预算恰好等于配额
+    combined_bytes = (logs / "combined.ndjson").stat().st_size
+    assert combined_bytes > quota // 2                     # 全量重排必被拒
+    assert 2 * (old_bytes + 1) <= quota                    # 旧成品本身的全量排序放得下
+    settings = make_settings(tmp_path, quota_bytes=quota, batch_bytes=128)
+
+    with TestClient(create_app(settings)) as client:
+        r = client.post("/api/jobs", json={"filename": "combined.ndjson"})
+        assert r.status_code == 400                        # 全量重排超额 → 拒绝
+        assert "配额一半" in r.json()["detail"]
+
+        base_job = submit(client, "base.ndjson")
+        assert wait_job(client, base_job)["state"] == "completed"
+
+        append_job = submit_append(client, base_job, "supp.ndjson")
+        snap = wait_job(client, append_job)
+        assert snap["state"] == "completed", snap["error"]
+        assert snap["reservation_bytes"] == quota          # 预算 = 旧成品 + 2×(补录+1)
+        body = client.get(f"/api/jobs/{append_job}/download").text
+        assert body == stable_merge(base_lines, supp_lines)
+        # 结果字节 = 旧成品 + 补录有效行（补录末行有换行，无补差）
+        assert client.get(f"/api/jobs/{append_job}").json()["result_bytes"] == \
+            old_bytes + supp_bytes
+        quota_now = client.get("/api/quota").json()
+        assert quota_now["reserved_bytes"] == 0
+        assert quota_now["temp_bytes_used"] == 0
+
+
+def test_append_failure_reports_and_keeps_old_product(tmp_path):
+    """补录失败：报告原因、清理本轮临时文件并释放预留，旧成品仍可下载。"""
+    settings = make_settings(tmp_path, quota_bytes=1 << 20, batch_bytes=128)
+    base_lines = write_log(settings.logs_dir, "base.ndjson",
+                           [{"ts_ms": BASE + i * 1000, "i": i} for i in range(4)])
+    (settings.logs_dir / "late_bad.ndjson").write_text(
+        '{"ts_ms": %d, "ok": 1}\n{"ts_ms": "not-a-time"}\n' % (BASE + 500,),
+        encoding="utf-8",
+    )
+    with TestClient(create_app(settings)) as client:
+        base_job = submit(client, "base.ndjson")
+        assert wait_job(client, base_job)["state"] == "completed"
+        before = client.get(f"/api/jobs/{base_job}/download")
+        assert before.status_code == 200
+
+        append_job = submit_append(client, base_job, "late_bad.ndjson")
+        snap = wait_job(client, append_job)
+        assert snap["state"] == "failed"
+        assert "第 2 行" in snap["error"]                   # 报告原因（含行号）
+        assert list(settings.temp_dir.iterdir()) == []      # 本轮临时文件已清理
+        quota = client.get("/api/quota").json()
+        assert quota["reserved_bytes"] == 0                 # 预留已释放
+        assert quota["temp_bytes_used"] == 0
+
+        after = client.get(f"/api/jobs/{base_job}/download")  # 旧成品仍可下载
+        assert after.status_code == 200
+        assert after.text == before.text == expected_body(base_lines)
+
+        # 服务恢复健康：换个合法补录文件照常完成
+        write_log(settings.logs_dir, "late_ok.ndjson",
+                  [{"ts_ms": BASE + 500, "ok": 1}])
+        ok_job = submit_append(client, base_job, "late_ok.ndjson")
+        assert wait_job(client, ok_job)["state"] == "completed"
+
+
+def test_append_write_failure_cleans_temp_and_releases_quota(tmp_path, monkeypatch):
+    """补录中途写盘失败（ENOSPC）：原因 + 清理 + 释放，旧成品不受影响。"""
+    settings = make_settings(tmp_path, quota_bytes=1 << 20)
+    write_log(settings.logs_dir, "base.ndjson", [{"ts_ms": BASE, "a": 1}])
+    write_log(settings.logs_dir, "late.ndjson", [{"ts_ms": BASE + 1, "a": 2}])
+
+    def boom_sort(src, work_dir, partial_out, **kwargs):
+        work_dir = Path(work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / "shard-00000.ndjson").write_bytes(b"z" * 128)
+        Path(partial_out).write_bytes(b"partial-output")
+        raise OSError(28, "No space left on device")
+
+    with TestClient(create_app(settings)) as client:
+        base_job = submit(client, "base.ndjson")
+        assert wait_job(client, base_job)["state"] == "completed"
+        before = client.get(f"/api/jobs/{base_job}/download").text
+
+        monkeypatch.setattr(jobs_module, "external_sort", boom_sort)
+        append_job = submit_append(client, base_job, "late.ndjson")
+        snap = wait_job(client, append_job)
+        assert snap["state"] == "failed"
+        assert "No space left on device" in snap["error"]
+        assert list(settings.temp_dir.iterdir()) == []
+        quota = client.get("/api/quota").json()
+        assert quota["reserved_bytes"] == 0
+        assert quota["temp_bytes_used"] == 0
+        assert client.get(f"/api/jobs/{base_job}/download").text == before
+
+
+def test_append_queueing_when_combined_exceeds_quota(tmp_path, monkeypatch):
+    """补录合跑放不下：单项预算够、两项合跑超额 → 第二项排队，前项完成后放行。"""
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True)
+    write_log(logs, "base.ndjson",
+              [{"ts_ms": BASE + i * 1000, "pad": "b" * 60, "i": i} for i in range(4)])
+    for idx in range(2):
+        write_log(logs, f"late{idx}.ndjson",
+                  [{"ts_ms": BASE + 500 + i * 900, "pad": "s" * 48, "k": idx, "i": i}
+                   for i in range(3)])
+    old_bytes = (logs / "base.ndjson").stat().st_size
+    supp_bytes = (logs / "late0.ndjson").stat().st_size
+    assert supp_bytes == (logs / "late1.ndjson").stat().st_size
+    quota = old_bytes + 2 * (supp_bytes + 1)  # 恰好容纳一项补录
+    settings = make_settings(tmp_path, quota_bytes=quota, batch_bytes=1 << 20)
+
+    real_sort = jobs_module.external_sort
+    first_entered = threading.Event()
+    release_first = threading.Event()
+
+    def gated_sort(*args, **kwargs):
+        if not first_entered.is_set():
+            first_entered.set()
+            if not release_first.wait(timeout=15):
+                raise RuntimeError("测试未及时放行第一个补录作业")
+        return real_sort(*args, **kwargs)
+
+    with TestClient(create_app(settings)) as client:
+        base_job = submit(client, "base.ndjson")
+        assert wait_job(client, base_job)["state"] == "completed"
+        base_body = client.get(f"/api/jobs/{base_job}/download").text
+
+        monkeypatch.setattr(jobs_module, "external_sort", gated_sort)
+        id1 = submit_append(client, base_job, "late0.ndjson")
+        id2 = submit_append(client, base_job, "late1.ndjson")
+
+        wait_until(first_entered.is_set, desc="第一个补录作业进入归并")
+        s1 = client.get(f"/api/jobs/{id1}").json()
+        s2 = client.get(f"/api/jobs/{id2}").json()
+        assert s1["state"] == "running"
+        assert s2["state"] == "queued"          # 合跑超额 → 排队
+        assert s2["queue_position"] == 0
+        assert client.get("/api/quota").json()["reserved_bytes"] == quota
+
+        release_first.set()
+        snaps = [wait_job(client, jid) for jid in (id1, id2)]
+        assert all(s["state"] == "completed" for s in snaps), snaps
+        for jid, name in ((id1, "late0.ndjson"), (id2, "late1.ndjson")):
+            body = client.get(f"/api/jobs/{jid}/download").text
+            late_lines = (logs / name).read_text().splitlines(keepends=True)
+            assert body == stable_merge(base_body.splitlines(keepends=True), late_lines)
+        quota_end = client.get("/api/quota").json()
+        assert quota_end["reserved_bytes"] == 0
+        assert quota_end["temp_bytes_used"] == 0
+
+
+def test_append_validation_errors(tmp_path):
+    """补录受理校验：基准不存在/未完成/成品缺失、补录文件问题、单项超额。"""
+    settings = make_settings(tmp_path, quota_bytes=1000)
+    write_log(settings.logs_dir, "base.ndjson", [{"ts_ms": BASE, "pad": "x" * 32}])
+    (settings.logs_dir / "bad.ndjson").write_text('{"ts_ms": "oops"}\n', encoding="utf-8")
+    write_log(settings.logs_dir, "ok.ndjson", [{"ts_ms": BASE + 1, "pad": "y" * 16}])
+    write_log(settings.logs_dir, "huge.ndjson",
+              [{"ts_ms": BASE + i, "pad": "z" * 120} for i in range(6)])
+
+    with TestClient(create_app(settings)) as client:
+        base_job = submit(client, "base.ndjson")
+        assert wait_job(client, base_job)["state"] == "completed"
+        failed_job = submit(client, "bad.ndjson")
+        assert wait_job(client, failed_job)["state"] == "failed"
+
+        url = lambda jid: f"/api/jobs/{jid}/append"
+        # 基准作业不存在 → 404
+        assert client.post(url("nope"), json={"filename": "ok.ndjson"}).status_code == 404
+        # 基准作业未完成 → 409
+        r = client.post(url(failed_job), json={"filename": "ok.ndjson"})
+        assert r.status_code == 409 and "failed" in r.json()["detail"]
+        # 补录文件不存在 → 404；文件名非法 → 400
+        assert client.post(url(base_job), json={"filename": "nope.ndjson"}).status_code == 404
+        assert client.post(url(base_job), json={"filename": "../x.ndjson"}).status_code == 400
+        # 单项补录预算超额 → 400
+        r = client.post(url(base_job), json={"filename": "huge.ndjson"})
+        assert r.status_code == 400 and "补录预算" in r.json()["detail"]
+        # 基准成品文件缺失 → 409
+        manager_result = settings.results_dir / f"{base_job}.ndjson"
+        saved = manager_result.read_bytes()
+        manager_result.unlink()
+        r = client.post(url(base_job), json={"filename": "ok.ndjson"})
+        assert r.status_code == 409 and "成品文件缺失" in r.json()["detail"]
+        manager_result.write_bytes(saved)  # 恢复现场
+        # 参数合法 → 受理
+        assert client.post(url(base_job), json={"filename": "ok.ndjson"}).status_code == 202
+
+
+def test_external_sort_with_base_merges_streams(tmp_path):
+    """单元级：base 作为 0 号流参与归并，同刻 base 行在前；base 文件不被改动。"""
+    base = tmp_path / "base.ndjson"
+    base_lines = [
+        json.dumps({"ts_ms": BASE + 1000, "origin": "base", "seq": 0}) + "\n",
+        json.dumps({"ts_ms": BASE + 3000, "origin": "base", "seq": 1}) + "\n",
+    ]
+    base.write_text("".join(base_lines), encoding="utf-8")
+    src = tmp_path / "supp.ndjson"
+    supp_lines = [
+        json.dumps({"ts_ms": BASE + 3000, "origin": "supp", "seq": 0}) + "\n",
+        json.dumps({"ts_ms": BASE + 2000, "origin": "supp", "seq": 1}) + "\n",
+    ]
+    src.write_text("".join(supp_lines), encoding="utf-8")
+    work, out = tmp_path / "work", tmp_path / "out.ndjson"
+
+    stats = external_sort(src, work, out, batch_bytes=40, ts_field="ts_ms", base=base)
+
+    assert out.read_text() == stable_merge(base_lines, supp_lines)
+    assert stats.output_bytes == len(out.read_bytes())
+    assert base.read_text() == "".join(base_lines)  # 旧成品原样保留
+    assert list(work.iterdir()) == []               # 本次分片已清理

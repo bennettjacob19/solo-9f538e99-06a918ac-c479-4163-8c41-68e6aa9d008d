@@ -6,8 +6,12 @@
 - 每行字节原样输出（仅对文件末行补一个换行符，避免归并时与下一行粘连；
   纯空白行跳过）。
 
-磁盘占用上界：分片合计 ≈ 输入字节数，输出 ≈ 输入字节数，
-归并末期二者同时存在，峰值 ≈ 2 倍输入。
+增量补录：external_sort 接受可选的 base（上一份已排序成品）。base 本身有序，
+作为归并的 0 号输入流顺序读一遍即可，同一毫秒的旧成品行先于本次补录分片输出；
+base 不占用临时区、不会被删除，也无须保留旧原始日志。
+
+磁盘占用上界：分片合计 ≈ 输入字节数，输出 ≈ 输入字节数（补录时另加 base 字节数），
+归并末期二者同时存在，峰值 ≈ 2 倍输入（补录时 ≈ base + 2 倍补录输入）。
 """
 from __future__ import annotations
 
@@ -151,12 +155,15 @@ def external_sort(
     batch_bytes: int,
     ts_field: str,
     on_bytes: Optional[BytesCallback] = None,
+    base=None,
 ) -> SortStats:
-    """把 src（NDJSON）外排到 partial_out。
+    """把 src（NDJSON）外排到 partial_out；base 非空时做增量补录归并。
 
     分批读入并排序落盘（分片位于 work_dir），再逐行归并到 partial_out；
-    成功后删除全部分片。任何读写/解析失败都抛出带原因的 SortError，
-    临时文件清理由调用方负责。
+    成功后删除本次的全部分片。base 是上一份已排序成品：本身有序，作为
+    归并的 0 号输入流只顺序读一遍，同一毫秒的旧成品行先于本次分片输出；
+    base 不写入临时区、不会被删除。任何读写/解析失败都抛出带原因的
+    SortError，临时文件清理由调用方负责。
     """
     if batch_bytes <= 0:
         raise ValueError("batch_bytes 必须为正数")
@@ -199,7 +206,10 @@ def external_sort(
         if batch:
             shards.append(_flush(batch, work_dir, len(shards), on_bytes))
 
-    output_bytes = _merge(shards, partial_out, ts_field, on_bytes)
+    # base（旧成品）作为 0 号输入流参与归并：同毫秒时堆元组按流编号决胜，
+    # 旧成品的行先于本次补录分片输出；base 只顺序读一遍，且不在清理列表中。
+    merge_inputs = ([Path(base)] if base is not None else []) + shards
+    output_bytes = _merge(merge_inputs, partial_out, ts_field, on_bytes)
 
     freed = 0
     for shard in shards:

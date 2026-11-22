@@ -1,4 +1,7 @@
-"""FastAPI 入口：在 /docs 选择只读目录中的 NDJSON 日志，提交排序、查状态、下载结果。"""
+"""FastAPI 入口：在 /docs 选择只读目录中的 NDJSON 日志，提交排序、查状态、下载结果。
+
+补录：在已完成作业上提交迟到事件文件，归并生成新的回放文件。
+"""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
@@ -12,9 +15,12 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .jobs import (
+    BaseNotCompleted,
+    BaseResultMissing,
     InputTooLarge,
     InvalidFilename,
     JobManager,
+    JobNotFound,
     JobState,
     LogNotFound,
 )
@@ -34,10 +40,21 @@ class SubmitRequest(BaseModel):
     )
 
 
+class AppendRequest(BaseModel):
+    filename: str = Field(
+        ...,
+        description="只读日志目录中的补录 NDJSON 文件名（迟到事件）",
+        examples=["port_events_late.ndjson"],
+    )
+
+
 def _job_view(snap: dict) -> dict:
     return {
         "job_id": snap["id"],
         "filename": snap["filename"],
+        "kind": snap["kind"].value,
+        "base_job_id": snap["base_job_id"],
+        "base_bytes": snap["base_bytes"],
         "state": snap["state"].value,
         "error": snap["error"],
         "input_bytes": snap["input_bytes"],
@@ -63,11 +80,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     app = FastAPI(
         title="交换机端口事件外排服务",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "交换机故障复盘：按 UTC 毫秒升序回放端口事件。"
-            "流程：GET /api/logs 选文件 → POST /api/jobs 提交 → "
+            "全量流程：GET /api/logs 选文件 → POST /api/jobs 提交 → "
             "GET /api/jobs/{job_id} 查状态 → GET /api/jobs/{job_id}/download 下载完整结果。"
+            "补录流程：POST /api/jobs/{job_id}/append 选补录文件，把迟到事件归并进"
+            "该已完成作业的成品，生成新的回放文件（同毫秒旧成品行在前，补录行按原行序接上；"
+            "新成品同样可作为下次补录的起点）。"
         ),
         lifespan=lifespan,
     )
@@ -86,6 +106,24 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     def submit(req: SubmitRequest):
         try:
             job = manager.submit(req.filename)
+        except LogNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (InvalidFilename, InputTooLarge) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _job_view(manager.snapshot(job.id))
+
+    @app.post(
+        "/api/jobs/{job_id}/append",
+        status_code=202,
+        summary="补录：选补录文件，把迟到事件归并进该已完成作业的成品",
+    )
+    def append(job_id: str, req: AppendRequest):
+        try:
+            job = manager.submit_append(job_id, req.filename)
+        except JobNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (BaseNotCompleted, BaseResultMissing) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except LogNotFound as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (InvalidFilename, InputTooLarge) as exc:

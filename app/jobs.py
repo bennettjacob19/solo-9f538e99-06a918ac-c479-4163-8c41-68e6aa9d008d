@@ -3,9 +3,11 @@
 配额模型：
 - 记账（实际）：临时区中所有作业的分片与未完成输出的文件字节合计
   （temp_bytes_used，经 on_bytes 回调逐笔增减）。
-- 预留（调度）：每个作业按 2*(输入+1) 字节预留额度，覆盖"分片 ≈ 1 倍输入 +
-  未完成输出 ≈ 1 倍输入"的峰值；预留总额不超过配额即可并行，否则 FIFO 排队。
-- 输入超过配额一半直接拒绝。
+- 预留（调度）：全量排序作业按 2*(输入+1) 字节预留（分片 ≈ 1 倍输入 +
+  未完成输出 ≈ 1 倍输入）；补录作业按 旧成品字节数 + 2*(补录输入+1) 预留
+  （补录分片 ≈ 1 倍补录 + 新输出 ≈ 旧成品 + 1 倍补录；末行补换行算入补录大小）。
+  预留总额不超过配额即可并行，否则 FIFO 排队。
+- 全量输入超过配额一半、或补录预算（旧成品 + 2 倍补录）超过配额，直接拒绝。
 """
 from __future__ import annotations
 
@@ -32,6 +34,11 @@ class JobState(str, Enum):
     FAILED = "failed"
 
 
+class JobKind(str, Enum):
+    FULL = "full"      # 全量排序
+    APPEND = "append"  # 补录：在已完成作业成品上归并迟到事件
+
+
 class LogNotFound(Exception):
     """日志文件不存在或不可读。"""
 
@@ -41,7 +48,19 @@ class InvalidFilename(Exception):
 
 
 class InputTooLarge(Exception):
-    """输入超过配额一半。"""
+    """全量输入超过配额一半，或补录预算超过配额。"""
+
+
+class JobNotFound(Exception):
+    """基准作业不存在。"""
+
+
+class BaseNotCompleted(Exception):
+    """基准作业未完成，不能作为补录起点。"""
+
+
+class BaseResultMissing(Exception):
+    """基准作业的成品文件缺失或不可读。"""
 
 
 @dataclass
@@ -50,6 +69,9 @@ class Job:
     filename: str
     input_bytes: int
     reservation_bytes: int
+    kind: JobKind = JobKind.FULL
+    base_job_id: Optional[str] = None  # 补录作业的基准作业号
+    base_bytes: int = 0                # 基准作业成品字节数（计入预留）
     state: JobState = JobState.QUEUED
     error: Optional[str] = None
     temp_bytes: int = 0
@@ -135,6 +157,65 @@ class JobManager:
             self._pump_locked()
         return job
 
+    def submit_append(self, base_job_id: str, filename: str) -> Job:
+        """补录：把迟到事件文件归并进已完成作业的成品，生成新的回放作业。
+
+        预留 = 旧成品字节数 + 2*(补录输入+1)（补末行换行算入补录大小）；
+        单项预算超过配额直接拒绝，合跑放不下则 FIFO 排队。
+        """
+        with self._cond:
+            base = self._jobs.get(base_job_id)
+            if base is None:
+                raise JobNotFound(f"基准作业不存在：{base_job_id}")
+            if base.state is not JobState.COMPLETED:
+                raise BaseNotCompleted(
+                    f"基准作业 {base_job_id} 当前状态为 {base.state.value}，"
+                    "仅 completed 可作为补录起点"
+                )
+        base_path = self.result_path(base_job_id)
+        try:
+            if not base_path.is_file():
+                raise BaseResultMissing(
+                    f"基准作业 {base_job_id} 的成品文件缺失，无法补录"
+                )
+            base_bytes = base_path.stat().st_size
+        except BaseResultMissing:
+            raise
+        except OSError as exc:
+            raise BaseResultMissing(
+                f"基准作业 {base_job_id} 的成品文件不可读（{exc}）"
+            ) from exc
+        path = self._resolve(filename)
+        try:
+            if not path.is_file():
+                raise LogNotFound(f"补录文件不存在：{filename}")
+            size = path.stat().st_size
+        except LogNotFound:
+            raise
+        except OSError as exc:
+            raise LogNotFound(f"补录文件不可读：{filename}（{exc}）") from exc
+        reservation = base_bytes + 2 * (size + 1)
+        if reservation > self.settings.quota_bytes:
+            raise InputTooLarge(
+                f"补录预算 {reservation} 字节（旧成品 {base_bytes} + 2×(补录 {size} + 1)）"
+                f"超过临时盘配额 {self.settings.quota_bytes}，拒绝受理"
+            )
+        job = Job(
+            id=uuid.uuid4().hex,
+            filename=filename,
+            input_bytes=size,
+            reservation_bytes=reservation,
+            kind=JobKind.APPEND,
+            base_job_id=base_job_id,
+            base_bytes=base_bytes,
+            created_at=time.time(),
+        )
+        with self._cond:
+            self._jobs[job.id] = job
+            self._queue.append(job.id)
+            self._pump_locked()
+        return job
+
     def snapshot(self, job_id: str) -> Optional[dict]:
         with self._cond:
             job = self._jobs.get(job_id)
@@ -155,6 +236,9 @@ class JobManager:
         return {
             "id": job.id,
             "filename": job.filename,
+            "kind": job.kind,
+            "base_job_id": job.base_job_id,
+            "base_bytes": job.base_bytes,
             "state": job.state,
             "error": job.error,
             "input_bytes": job.input_bytes,
@@ -218,6 +302,13 @@ class JobManager:
             src = self._resolve(job.filename)
             if not src.is_file():
                 raise SortError(f"读取输入文件失败：{job.filename} 已不存在")
+            base_path = None
+            if job.kind is JobKind.APPEND:
+                base_path = self.result_path(job.base_job_id)
+                if not base_path.is_file():
+                    raise SortError(
+                        f"旧成品缺失：基准作业 {job.base_job_id} 的结果文件不存在"
+                    )
             stats = external_sort(
                 src,
                 work_dir,
@@ -225,6 +316,7 @@ class JobManager:
                 batch_bytes=self.settings.batch_bytes,
                 ts_field=self.settings.ts_field,
                 on_bytes=lambda delta: self._add_temp(job.id, delta),
+                base=base_path,
             )
             final = self.result_path(job.id)
             try:
